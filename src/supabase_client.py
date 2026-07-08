@@ -150,9 +150,9 @@ class SupabaseClient:
                 params={"select": "id", "limit": 0},
             )
 
-            if response.status_code == 200:
+            if response.status_code in (200, 206):
                 content_range = response.headers.get("content-range", "")
-                # Format: "0-0/12345"
+                # Format: "0-0/12345" or "*/12345"
                 if "/" in content_range:
                     try:
                         return int(content_range.split("/")[1])
