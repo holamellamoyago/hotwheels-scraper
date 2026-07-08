@@ -25,7 +25,6 @@ from datetime import date
 
 from .scraper import (
     FIRST_YEAR,
-    create_scraper,
     get_available_years,
     scrape_years,
 )
@@ -95,9 +94,8 @@ def main():
         logger.info(f"🎯 Default: current year ({current_year})")
 
     # Scrape
-    scraper = create_scraper()
     logger.info("🕷️  Starting scraper...")
-    result, all_cars = scrape_years(years, scraper=scraper, delay=args.delay)
+    result, all_cars = scrape_years(years, delay=args.delay)
 
     print()  # blank line for readability
     print("=" * 50)

@@ -1,8 +1,8 @@
 """
 Hot Wheels wiki scraper.
 
-Scrapes the Hot Wheels Fandom Wiki for yearly car lists.
-Handles Cloudflare protection via cloudscraper.
+Uses the Fandom API (api.php) instead of scraping HTML pages directly,
+which avoids Cloudflare blocks on GitHub Actions.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import logging
 import time
 from typing import Optional
 
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup, Tag
 
 from .models import HotWheelsCar, ScrapeResult
@@ -21,53 +21,58 @@ logger = logging.getLogger(__name__)
 # Hot Wheels started in 1968
 FIRST_YEAR = 1968
 
-# Base URL for yearly lists
-WIKI_BASE = "https://hotwheels.fandom.com/wiki/List_of_{year}_Hot_Wheels"
+# Fandom API base URL
+API_BASE = "https://hotwheels.fandom.com/api.php"
 
-# User-Agent to mimic a real browser
+# User-Agent
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "HotWheelsScraper/1.0 "
+    "(https://github.com/holamellamoyago/hotwheels-scraper; "
+    "contact@example.com)"
 )
 
 
-def create_scraper() -> cloudscraper.CloudScraper:
-    """Create a cloudscraper session that bypasses Cloudflare."""
-    scraper = cloudscraper.create_scraper(
-        browser={
-            "browser": "chrome",
-            "platform": "windows",
-            "mobile": False,
-        },
-        interpreter="js2py",  # lightweight JS interpreter for Cloudflare challenges
-    )
-    scraper.headers.update({"User-Agent": USER_AGENT})
-    return scraper
-
-
-def fetch_page(scraper: cloudscraper.CloudScraper, url: str) -> Optional[str]:
-    """Fetch a wiki page, returning HTML content or None on failure."""
+def _api_get(params: dict, timeout: int = 30) -> Optional[dict]:
+    """Call the Fandom API and return the JSON response, or None on failure."""
     try:
-        resp = scraper.get(url, timeout=30)
+        resp = requests.get(
+            API_BASE,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+        )
         if resp.status_code == 200:
-            return resp.text
+            return resp.json()
         elif resp.status_code == 404:
-            logger.warning(f"Page not found: {url}")
+            logger.warning(f"API 404 for params: {params}")
             return None
         else:
-            logger.warning(f"HTTP {resp.status_code} for {url}")
+            logger.warning(f"API HTTP {resp.status_code} for params: {params}")
             return None
     except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
+        logger.error(f"API error: {e}")
         return None
 
 
-def parse_car_table(
-    html: str, year: int
-) -> list[HotWheelsCar]:
+def fetch_page_html(year: int) -> Optional[str]:
     """
-    Parse a wikitable from a yearly Hot Wheels list page.
+    Fetch the HTML table for a given year via the Fandom parse API.
+    Returns the HTML string from parse.text.* or None.
+    """
+    data = _api_get({
+        "action": "parse",
+        "page": f"List_of_{year}_Hot_Wheels",
+        "prop": "text",
+        "format": "json",
+    })
+    if data and "parse" in data and "text" in data["parse"]:
+        return data["parse"]["text"]["*"]
+    return None
+
+
+def parse_car_table(html: str, year: int) -> list[HotWheelsCar]:
+    """
+    Parse a wikitable from the Fandom API HTML output.
 
     Returns a list of HotWheelsCar objects found in the table(s).
     """
@@ -92,7 +97,6 @@ def parse_car_table(
                 data_rows.append(row)
 
         if not data_rows:
-            # Try harder: maybe the first row is data despite having <th>
             continue
 
         for row in data_rows:
@@ -100,11 +104,8 @@ def parse_car_table(
             if not cells:
                 continue
 
-            # Determine cell structure
-            # Typical layout: Toy# | Col | Model Name | Series | Series# | Photo
             car = HotWheelsCar(year=year)
 
-            # Try to extract from known column patterns
             parsed = _parse_cells(cells, year, table_idx)
             if parsed:
                 car.toy_num = parsed.get("toy_num")
@@ -147,30 +148,25 @@ def _parse_cells(
         texts.append(text)
 
     if num_cells >= 6:
-        # Standard layout: Toy# | Col# | Model | Series | Series# | Image
         result["toy_num"] = texts[0]
         result["col_num"] = texts[1]
         result["model_name"] = texts[2]
         result["series"] = texts[3]
         result["series_num"] = texts[4]
     elif num_cells == 5:
-        # Layout without column number
         result["toy_num"] = texts[0]
         result["model_name"] = texts[1]
         result["series"] = texts[2]
         result["series_num"] = texts[3]
     elif num_cells == 4:
-        # Compact layout: Toy# | Model | Series | Photo
         result["toy_num"] = texts[0]
         result["model_name"] = texts[1]
         result["series"] = texts[2]
     elif num_cells == 3:
-        # Minimal layout: Toy# | Model | Series
         result["toy_num"] = texts[0]
         result["model_name"] = texts[1]
         result["series"] = texts[2]
     else:
-        # Unknown layout - try to at least get something
         if num_cells >= 2:
             result["toy_num"] = texts[0]
             result["model_name"] = texts[1]
@@ -195,7 +191,6 @@ def _extract_image_url(row: Tag) -> Optional[str]:
         # Try srcset first (higher resolution)
         srcset = img.get("srcset")
         if srcset:
-            # srcset format: "url width, url width, ..."
             first_url = srcset.split(",")[0].strip().split(" ")[0]
             if first_url.startswith("http"):
                 return first_url
@@ -216,31 +211,25 @@ def get_available_years() -> list[int]:
 
 def scrape_years(
     years: list[int],
-    scraper: Optional[cloudscraper.CloudScraper] = None,
     delay: float = 1.0,
-) -> ScrapeResult:
+) -> tuple[ScrapeResult, list[HotWheelsCar]]:
     """
-    Scrape multiple years from the Hot Wheels wiki.
+    Scrape multiple years from the Hot Wheels Fandom wiki via the API.
 
     Args:
         years: List of years to scrape.
-        scraper: Optional cloudscraper instance (creates one if not provided).
         delay: Delay in seconds between requests to be polite.
 
     Returns:
-        ScrapeResult with all collected cars.
+        Tuple of (ScrapeResult, list of all cars).
     """
-    if scraper is None:
-        scraper = create_scraper()
-
     result = ScrapeResult()
     all_cars: list[HotWheelsCar] = []
 
     for year in years:
-        url = WIKI_BASE.format(year=year)
         logger.info(f"Scraping {year}...")
 
-        html = fetch_page(scraper, url)
+        html = fetch_page_html(year)
         if html is None:
             result.skipped_years.append(year)
             continue
