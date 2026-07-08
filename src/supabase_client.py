@@ -52,8 +52,9 @@ class SupabaseClient:
         """
         Upsert cars into Supabase.
 
-        Uses the unique constraint (year, toy_num, model_name) to determine
-        insert vs update.
+        Deduplicates by (year, toy_num, model_name) within the batch to avoid
+        "ON CONFLICT DO UPDATE command cannot affect row a second time" errors.
+        Ensures all records in a batch have identical keys to avoid PGRST102.
 
         Returns:
             Tuple of (inserted_count, updated_count).
@@ -65,12 +66,25 @@ class SupabaseClient:
             logger.error("Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY.")
             return 0, 0
 
-        # Convert to dicts and remove None values (Supabase handles them)
-        records = []
+        # Deduplicate: keep first occurrence of each (year, toy_num, model_name)
+        seen: set[tuple] = set()
+        deduped: list[HotWheelsCar] = []
         for car in cars:
-            record = car.to_supabase_dict()
-            # Remove None values so Supabase uses defaults
-            record = {k: v for k, v in record.items() if v is not None}
+            key = (car.year, car.toy_num, car.model_name)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(car)
+
+        skipped = len(cars) - len(deduped)
+        if skipped:
+            logger.info(f"  Deduplicated {skipped} cars within batch")
+
+        # Convert to dicts with ALL keys present (None for missing, Supabase ignores them)
+        all_keys = ["toy_num", "model_name", "series", "series_num", "year", "image_url", "raw_data"]
+        records = []
+        for car in deduped:
+            base = car.to_supabase_dict()
+            record = {k: base.get(k) for k in all_keys}
             records.append(record)
 
         # Split into batches of 100 (Supabase limit)
@@ -124,22 +138,25 @@ class SupabaseClient:
     def get_car_count(self) -> int:
         """Get the total number of cars in the database."""
         endpoint = f"{self.url}/rest/v1/cars"
-        headers = {"Accept": "application/json", **self.headers}
 
         with httpx.Client(timeout=10) as client:
             response = client.get(
                 endpoint,
-                headers=headers,
+                headers={
+                    "apikey": self.service_key or self.anon_key,
+                    "Authorization": f"Bearer {self.service_key or self.anon_key}",
+                    "Prefer": "count=exact",
+                },
                 params={"select": "id", "limit": 0},
             )
 
             if response.status_code == 200:
-                # Look at content-range header for count
-                content_range = response.headers.get("content-range", "0-0/0")
-                try:
-                    total = int(content_range.split("/")[1])
-                    return total
-                except (IndexError, ValueError):
-                    pass
+                content_range = response.headers.get("content-range", "")
+                # Format: "0-0/12345"
+                if "/" in content_range:
+                    try:
+                        return int(content_range.split("/")[1])
+                    except (IndexError, ValueError):
+                        pass
 
         return 0
