@@ -33,10 +33,11 @@ CREATE INDEX IF NOT EXISTS idx_cars_series ON cars(series);
 CREATE INDEX IF NOT EXISTS idx_cars_year_series ON cars(year, series);
 CREATE INDEX IF NOT EXISTS idx_cars_created_at ON cars(created_at DESC);
 
--- Full-text search index for searching by model name
+-- Full-text search: enable pg_trgm extension first (required for gin_trgm_ops)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Trigram index for fuzzy search on model names
 CREATE INDEX IF NOT EXISTS idx_cars_model_name_trgm ON cars USING gin (model_name gin_trgm_ops);
--- Note: requires pg_trgm extension:
--- CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ============================================
 -- Auto-update updated_at on row change
